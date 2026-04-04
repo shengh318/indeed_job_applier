@@ -131,6 +131,51 @@ def extract_radio_choices(question_el):
     return choices
 
 
+def find_question_container(driver, input_id=None, input_name=None):
+    """Find the nearest question container div for an input by id or name.
+
+    Returns the container WebElement or None.
+    """
+    input_elem = None
+    if input_id:
+        try:
+            input_elem = driver.find_element(By.ID, input_id)
+        except Exception:
+            input_elem = None
+
+    if input_elem is None and input_name:
+        try:
+            input_elem = driver.find_element(By.NAME, input_name)
+        except Exception:
+            input_elem = None
+
+    if input_elem is None:
+        return None
+
+    # Prefer the specific question container class used by Indeed, otherwise fallback to nearest div
+    try:
+        q_el = input_elem.find_element(
+            By.XPATH, "./ancestor::div[contains(@class,'mosaic-provider-module-apply-questions-v6n2in') or contains(@class,'ia-Questions-item')][1]")
+        return q_el
+    except Exception:
+        pass
+
+    try:
+        return input_elem.find_element(By.XPATH, "./ancestor::div[1]")
+    except Exception:
+        return None
+
+
+def get_radio_choices_for_field(field, driver):
+    """Given a field dict (from extract_apply_questions), return radio choices for that question only."""
+    input_id = field.get('id') if field else None
+    input_name = field.get('name') if field else None
+    q_el = find_question_container(driver, input_id, input_name)
+    if q_el is None:
+        return []
+    return extract_radio_choices(q_el)
+
+
 def extract_apply_questions(driver, timeout=10):
     wait = WebDriverWait(driver, timeout)
     cards = wait.until(EC.presence_of_all_elements_located(
@@ -199,39 +244,7 @@ for card in cards[:1]:
     for q in questions:
         choices = q['field']['type']
         if q['field']['type'] == 'radio':
-            input_id = q['field'].get('id') or ''
-            input_name = q['field'].get('name') or ''
-            q_el = None
-
-            # Prefer locating the input element first (handles special chars), then find its question container
-            input_elem = None
-            if input_id:
-                try:
-                    input_elem = driver.find_element(By.ID, input_id)
-                except Exception:
-                    input_elem = None
-
-            if input_elem is None and input_name:
-                try:
-                    input_elem = driver.find_element(By.NAME, input_name)
-                except Exception:
-                    input_elem = None
-
-            if input_elem is not None:
-                # find the nearest ancestor div that matches Indeed's question container classes
-                try:
-                    q_el = input_elem.find_element(
-                        By.XPATH, "./ancestor::div[contains(@class,'mosaic-provider-module-apply-questions-v6n2in') or contains(@class,'ia-Questions-item')][1]")
-                except Exception:
-                    try:
-                        q_el = input_elem.find_element(
-                            By.XPATH, "./ancestor::div[1]")
-                    except Exception:
-                        q_el = None
-
-            radio_choices = []
-            if q_el is not None:
-                radio_choices = extract_radio_choices(q_el)
+            radio_choices = get_radio_choices_for_field(q['field'], driver)
             choices = ", ".join(
                 [f"{c['label']}({c['value']})" for c in radio_choices])
 
