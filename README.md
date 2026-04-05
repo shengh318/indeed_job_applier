@@ -1,48 +1,81 @@
 # indeed_job_applier
 
-### Environment Set up (Only need to do once)
+## Environment setup (one-time)
 
-1. Download Python if not installed. Check with:
+Install Python if not already present.
 
-```code
+- macOS / Linux:
+
+```bash
 python3 --version
 ```
 
-2. Start up venv in the folder
+- Windows (Command Prompt / PowerShell):
 
-```code
-python3 -m venv venv
+```powershell
+python --version
 ```
 
-3. Source it
+Create and activate a virtual environment:
 
-```code
+- macOS / Linux:
+
+```bash
+python3 -m venv venv
 source venv/bin/activate
 ```
 
-4. Install Requirements
+- Windows (PowerShell):
 
-```code
+```powershell
+python -m venv venv
+venv\Scripts\Activate.ps1
+```
+
+- Windows (cmd):
+
+```cmd
+python -m venv venv
+venv\Scripts\activate.bat
+```
+
+Install project dependencies:
+
+```bash
 pip install -r requirements.txt
 ```
 
-### Running script, need to do both steps whenever you decide to restart script
-1. Start up chrome in debug mode on port 1559.
+## Running the script
 
-Mac:
+Every time you run the automation you'll need to start Chrome with remote debugging enabled, then run the Python script. The remote debugging port in the command below must match the address used by `start_chrome()` (default: `127.0.0.1:1559`).
 
-```code
+- macOS (example):
+
+```bash
 /Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome --remote-debugging-port=1559 --user-data-dir=/tmp/chrome-debug
 ```
 
-PC:
+- Windows (PowerShell example):
 
-```code
-C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=1559 --user-data-dir="C:\temp\chrome_debug_profile
+```powershell
+& 'C:\Program Files\Google\Chrome\Application\chrome.exe' --remote-debugging-port=1559 --user-data-dir='C:\temp\chrome_debug_profile'
 ```
 
-2. Run this command:
+- Windows (cmd example):
 
-```code
+```cmd
+"C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=1559 --user-data-dir="C:\temp\chrome_debug_profile"
+```
+
+Notes:
+- Use a separate `--user-data-dir` to avoid interfering with your primary Chrome profile.
+- If Chrome is already running, close it first or use a distinct `user-data-dir` path to avoid a profile-in-use error.
+
+Run the script (use `python` or `python3` depending on your environment):
+
+```bash
 python3 chrome_box.py
 ```
+
+On Windows you may need to run `python chrome_box.py` instead of `python3`.
+
