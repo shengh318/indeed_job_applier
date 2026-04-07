@@ -1,5 +1,8 @@
 import os
+from pydoc import cli
 import tempfile
+import platform
+from dotenv import load_dotenv
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
@@ -7,6 +10,87 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+import requests
+import json
+
+IS_WINDOWS = platform.system() == "Windows"
+load_dotenv()
+
+
+def ensure_element_interactable(driver, elem, wait=None, timeout=2):
+    """Return a clickable element for the given element.
+
+    - Scrolls the element into view and waits briefly for non-zero size.
+    - If the element has no size, searches visible ancestors (button/a/div/span).
+    - Returns the first element that appears to have a non-zero bounding rect.
+    - Caller should still handle click exceptions and fall back to JS click.
+    """
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});", elem)
+    except Exception:
+        pass
+
+    check_js = "const r=arguments[0].getBoundingClientRect(); return r.width>0 && r.height>0"
+    try:
+        if wait is not None:
+            wait.until(lambda d: d.execute_script(check_js, elem))
+            return elem
+        elif driver.execute_script(check_js, elem):
+            return elem
+    except Exception:
+        pass
+
+    # try common clickable ancestors
+    for tag in ("button", "a", "div", "span"):
+        try:
+            anc = elem.find_element(By.XPATH, f"./ancestor::{tag}[1]")
+            try:
+                if driver.execute_script(check_js, anc):
+                    return anc
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+    # nothing found - return original element (caller will fallback to JS click)
+    return elem
+
+
+def find_elements_in_frames(driver, by, value):
+    """Search for elements in the current context and recursively inside iframes.
+
+    Returns a list of WebElements (possibly empty). Restores frame context on return.
+    """
+    try:
+        elems = driver.find_elements(by, value)
+        if elems:
+            return elems
+    except Exception:
+        elems = []
+
+    # search inside iframes recursively
+    iframes = []
+    try:
+        iframes = driver.find_elements(By.TAG_NAME, "iframe")
+    except Exception:
+        iframes = []
+
+    for f in iframes:
+        try:
+            driver.switch_to.frame(f)
+            found = find_elements_in_frames(driver, by, value)
+            if found:
+                return found
+        except Exception:
+            pass
+        finally:
+            try:
+                driver.switch_to.parent_frame()
+            except Exception:
+                pass
+
+    return []
 
 
 def start_chrome(
@@ -23,7 +107,8 @@ def start_chrome(
     """
     chrome_options = Options()
     if debugger_address:
-        chrome_options.add_experimental_option("debuggerAddress", debugger_address)
+        chrome_options.add_experimental_option(
+            "debuggerAddress", debugger_address)
 
     if profile_dir is None:
         profile_dir = os.environ.get("CHROME_DEBUG_PROFILE") or os.path.expanduser(
@@ -36,7 +121,8 @@ def start_chrome(
         os.makedirs(profile_dir, exist_ok=True)
     except Exception:
         # fallback to system temp dir if creation fails
-        profile_dir = os.path.join(tempfile.gettempdir(), "chrome_debug_profile")
+        profile_dir = os.path.join(
+            tempfile.gettempdir(), "chrome_debug_profile")
         os.makedirs(profile_dir, exist_ok=True)
 
     chrome_options.add_argument(f"--user-data-dir={profile_dir}")
@@ -79,7 +165,7 @@ def insert_job_and_location(
     location_input_box.click()
 
     # if os is windows:
-    if driver.capabilities["platformName"].lower() == "windows":
+    if IS_WINDOWS:
         location_input_box.send_keys(Keys.CONTROL, "a", Keys.DELETE)
     else:
         location_input_box.send_keys(Keys.COMMAND, "a", Keys.DELETE)
@@ -99,43 +185,134 @@ def insert_job_and_location(
 
 
 def click_into_job_card(driver, card, wait):
+    # ensure the card is visible before interacting
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});", card)
+        try:
+            wait.until(lambda d: card.is_displayed())
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     a = card.find_element(By.CSS_SELECTOR, "h2.jobTitle a")
     title = a.find_element(By.CSS_SELECTOR, "span").text.strip()
     href = a.get_attribute("href")
     jk = a.get_attribute("data-jk")
     job_url = f"https://www.indeed.com/viewjob?jk={jk}" if jk else href
 
-    ActionChains(driver).key_down(Keys.COMMAND).click(a).key_up(Keys.COMMAND).perform()
+    if IS_WINDOWS:
+        ActionChains(driver).key_down(Keys.CONTROL).click(
+            a).key_up(Keys.CONTROL).perform()
+    else:
+        ActionChains(driver).key_down(Keys.COMMAND).click(
+            a).key_up(Keys.COMMAND).perform()
     wait.until(lambda d: len(d.window_handles) > 1)
     driver.switch_to.window(driver.window_handles[-1])
-    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
+    wait.until(lambda d: d.execute_script(
+        "return document.readyState") == "complete")
     return title, job_url
 
 
 def try_to_click_apply_button(driver, timeout=10):
     wait = WebDriverWait(driver, timeout)
 
-    # Only attempt if the apply button exists on the page
-    elems = driver.find_elements(By.ID, "indeedApplyButton")
+    # Try multiple selectors (robust fallbacks). Include the XPath the user provided.
+    locators = [
+        (By.ID, "indeedApplyButton"),
+        (By.XPATH,
+         '/html/body/div/div/div[2]/div[3]/div/div/div[1]/div[2]/div[5]/div[1]/div/div/div/div/span/div/button'),
+    ]
+    elems = []
+    abs_xpath = '/html/body/div/div/div[2]/div[3]/div/div/div[1]/div[2]/div[5]/div[1]/div/div/div/div/span/div/button'
+    for by, val in locators:
+        try:
+            candidates = find_elements_in_frames(driver, by, val)
+        except Exception:
+            candidates = []
+
+        if not candidates:
+            print(f"No candidates found for locator {by}={val}")
+            continue
+
+        # if this is the absolute xpath, only accept elements explicitly labeled "Apply with Indeed"
+        if by == By.XPATH and val == abs_xpath:
+            filtered = []
+            for e in candidates:
+                try:
+                    print(e.get_attribute("aria-label"))
+                    if (e.get_attribute("aria-label") or "").strip() == "Apply with Indeed":
+                        filtered.append(e)
+                except Exception:
+                    continue
+            if not filtered:
+                # do not accept this locator, keep trying other locators
+                continue
+            elems = filtered
+            break
+
+        elif by == By.ID and val == "indeedApplyButton":
+            btn = candidates[0]
+
+            # wait for it to be clickable (best-effort)
+            try:
+                wait.until(lambda d: btn.is_displayed() and btn.is_enabled())
+            except Exception:
+                pass
+
+            # ensure visible
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", btn)
+
+            # try normal click, fallback to JS
+            try:
+                btn.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", btn)
+
+            # Do not switch tabs/windows here; caller will handle navigation if needed
+            return True
+        else:
+            pass
+
+        elems = candidates
+        break
+
+    # final generic fallback: any button containing the word 'apply' (case-insensitive)
+    if not elems:
+        try:
+            elems = find_elements_in_frames(
+                driver,
+                By.XPATH,
+                "//button[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'apply')]",
+            )
+        except Exception:
+            elems = []
+
     if not elems:
         return False
 
     btn = elems[0]
 
-    # wait for it to be clickable (best-effort)
+    # try to get a truly interactable element (visible + non-zero size)
+    btn = ensure_element_interactable(driver, btn, wait)
+
+    # wait for it to be displayed/enabled if possible
     try:
         wait.until(lambda d: btn.is_displayed() and btn.is_enabled())
     except Exception:
         pass
 
-    # ensure visible
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
-
-    # try normal click, fallback to JS
+    # attempt move and click, fallback to JS click
     try:
-        btn.click()
+        ActionChains(driver).move_to_element(
+            btn).pause(0.1).click(btn).perform()
     except Exception:
-        driver.execute_script("arguments[0].click();", btn)
+        try:
+            btn.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", btn)
 
     # Do not switch tabs/windows here; caller will handle navigation if needed
     return True
@@ -154,58 +331,65 @@ def click_continue(driver, wait):
         )
     )
 
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", btn)
+    driver.execute_script(
+        "arguments[0].scrollIntoView({block:'center'});", btn)
     try:
         btn.click()
     except Exception:
         driver.execute_script("arguments[0].click();", btn)
 
     # wait for either navigation or modal/result change
-    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-    return True
+    wait.until(lambda d: d.execute_script(
+        "return document.readyState") == "complete")
 
 
 def click_on_resume(driver, wait):
-    resume = wait.until(
-        EC.element_to_be_clickable(
-            (
-                By.CSS_SELECTOR,
-                '[data-testid="resume-selection-file-resume-radio-card-body"]',
-            )
-        )
-    )
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", resume)
-    resume.click()
-    return True
+    card = wait.until(EC.element_to_be_clickable(
+        (By.CSS_SELECTOR,
+         '[data-testid="resume-selection-file-resume-radio-card"]')
+    ))
+    card.click()
 
 
 def click_on_resume_continue(driver, wait):
-    try:
-        continue_btn = wait.until(
-            EC.element_to_be_clickable(
-                (By.CSS_SELECTOR, 'button[data-testid="continue-button"]')
-            )
-        )
-    except Exception:
-        continue_btn = wait.until(
-            EC.element_to_be_clickable(
-                (
-                    By.XPATH,
-                    "//*[@id='mosaic-provider-module-apply-resume-selection']//button[normalize-space(.)='Continue']",
-                )
-            )
-        )
+    continue_btn = wait.until(EC.element_to_be_clickable(
+        (By.CSS_SELECTOR, '[data-testid="continue-button"]')
+    ))
+    continue_btn.click()
 
-    driver.execute_script(
-        "arguments[0].scrollIntoView({block:'center'});", continue_btn
+
+def click_education_save_and_continue(driver, wait):
+    continue_btn = wait.until(EC.element_to_be_clickable(
+        (By.CSS_SELECTOR,
+         '[data-testid="education-page-review-continue-button"]')
+    ))
+    continue_btn.click()
+
+
+def click_work_experience_save_and_continue(driver, wait):
+    continue_btn = wait.until(EC.element_to_be_clickable(
+        (By.CSS_SELECTOR,
+         '[data-testid="work-experience-page-review-continue-button"]')
+    ))
+    continue_btn.click()
+
+
+def click_agree_checkbox(driver, wait):
+    checkboxes = driver.find_elements(By.XPATH, '//input[@type="checkbox"]')
+    checkboxes[0].click()
+
+
+def detect_last_step_and_submit(driver, wait):
+    elements = driver.find_elements(
+        By.XPATH,
+        '//span[contains(text(), "Check this box to receive calls or text messages")]'
     )
-    try:
-        continue_btn.click()
-    except Exception:
-        driver.execute_script("arguments[0].click();", continue_btn)
 
-    wait.until(lambda d: d.execute_script("return document.readyState") == "complete")
-    return True
+    if elements:
+        print("Last step detected")
+        click_agree_checkbox(driver, wait)
+        return True
+    return False
 
 
 def extract_radio_choices(question_el):
@@ -218,7 +402,8 @@ def extract_radio_choices(question_el):
 
         if rid:
             try:
-                lab = question_el.find_element(By.CSS_SELECTOR, f"label[for='{rid}']")
+                lab = question_el.find_element(
+                    By.CSS_SELECTOR, f"label[for='{rid}']")
                 label_text = lab.text.strip()
             except:
                 pass
@@ -291,7 +476,8 @@ def get_radio_choices_for_field(field, driver):
 def extract_apply_questions(driver, timeout=10):
     wait = WebDriverWait(driver, timeout)
     cards = wait.until(
-        EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div.ia-Questions-item"))
+        EC.presence_of_all_elements_located(
+            (By.CSS_SELECTOR, "div.ia-Questions-item"))
     )
     results = []
     for c in cards:
@@ -302,7 +488,8 @@ def extract_apply_questions(driver, timeout=10):
         except Exception:
             # fallback to any <label> text
             try:
-                question_text = c.find_element(By.TAG_NAME, "label").text.strip()
+                question_text = c.find_element(
+                    By.TAG_NAME, "label").text.strip()
             except Exception:
                 question_text = ""
 
@@ -354,7 +541,8 @@ def get_questions_and_choices(driver) -> dict[str, list[dict]]:
             choices = get_radio_choices_for_field(field, driver)
 
         elif ftype == "select":
-            q_el = find_question_container(driver, field.get("id"), field.get("name"))
+            q_el = find_question_container(
+                driver, field.get("id"), field.get("name"))
             if q_el is not None:
                 try:
                     sel = q_el.find_element(By.TAG_NAME, "select")
@@ -368,9 +556,11 @@ def get_questions_and_choices(driver) -> dict[str, list[dict]]:
 
         elif ftype == "checkbox":
             # collect checkbox options in the question container
-            q_el = find_question_container(driver, field.get("id"), field.get("name"))
+            q_el = find_question_container(
+                driver, field.get("id"), field.get("name"))
             if q_el is not None:
-                inputs = q_el.find_elements(By.CSS_SELECTOR, "input[type='checkbox']")
+                inputs = q_el.find_elements(
+                    By.CSS_SELECTOR, "input[type='checkbox']")
                 for inp in inputs:
                     iid = inp.get_attribute("id")
                     val = inp.get_attribute("value")
@@ -385,11 +575,13 @@ def get_questions_and_choices(driver) -> dict[str, list[dict]]:
                             pass
                     if not label_text:
                         try:
-                            parent = inp.find_element(By.XPATH, "./ancestor::label[1]")
+                            parent = inp.find_element(
+                                By.XPATH, "./ancestor::label[1]")
                             label_text = parent.text.strip()
                         except Exception:
                             pass
-                    choices.append({"id": iid, "value": val, "label": label_text})
+                    choices.append(
+                        {"id": iid, "value": val, "label": label_text})
 
         else:
             # free-text, textarea, unknown types -> no structured choices
@@ -424,10 +616,14 @@ def turn_question_mappings_into_ai_prompt(
      - text
     """
     prompt = f"""
-    You are applying to a job and need to answer the following application questions. You may use any information from the web to search for relevant information about the company. You are trying to apply to the job so if you need to say things that sounds good for the recruiter, you can say those things as long as they align with the resume skills. For each question, provide the best answer based on the choices given. If the question is free-text, provide a 4 sentence concise and relevant response. Here is the path to the resume that you want to look at:
-    
-    
-    . Return back to me your response in this template:
+    You are applying to a job and need to answer the following application questions. You may use any information from the web to search for relevant information about the company. You are trying to apply to the job so if you need to say things that sounds good for the recruiter, you can say those things as long as they align with the resume skills.
+
+    I am willing to work 5 days a week. I don't have a specific salary requirement but I want to be paid fairly based on market rate for this role. I am looking for a full-time position. I am available to start immediately. I have the legal right to work in the United States. I am willing to relocate for the right opportunity, but I prefer jobs in the Cambridge, MA area.
+
+    For each question, provide the best answer based on the choices given. If the question is free-text, provide a 4 sentence concise and relevant response. Here is the path to the resume that you want to look at:
+
+
+    . Return back to me your response in this template. Just give me back the text without any explanation, preamble, or any kind of formatting, not markdown, just plain text that I can easily parse:
 
         1: <your answer to question 1>
         2: <your answer to question 2>
@@ -448,3 +644,124 @@ def turn_question_mappings_into_ai_prompt(
         prompt += "\n"
 
     return prompt
+
+
+def send_request_to_ai_model(prompt: str):
+    """Send the prompt to an AI model and get back a mapping of question -> answer value.
+
+    Uses streaming and a very large/no timeout so long-running generations don't get cut
+    off by the client. If you're fronted by a reverse-proxy (nginx/gunicorn/etc.) you may
+    still need to increase proxy timeouts there as well.
+    """
+    print("Sending the following prompt to the AI model....")
+    url = os.environ.get("AI_MODEL_URL") or "http://127.0.0.1:1234/api/v1/chat"
+    model = os.environ.get("AI_MODEL_NAME") or "qwen/qwen3.5-9b"
+    payload = {"model": model, "input": prompt,
+               "integrations": ["mcp/web-search"]}
+    headers = {"Authorization": f"Bearer {os.environ.get('LM_STUDIO_TOKEN')}",
+               "Content-Type": "application/json", "Connection": "keep-alive"}
+
+    try:
+        # stream=True and no read timeout (timeout=None) — keep connection open
+        resp = requests.post(
+            url, json=payload, headers=headers, stream=True, timeout=None)
+        resp.raise_for_status()
+
+        chunks = []
+        # iterate as the server streams data; printing keeps the client active
+        for line in resp.iter_lines(decode_unicode=True):
+            if line:
+                chunks.append(line)
+
+        text = "\n".join(chunks) if chunks else resp.text
+
+        # attempt to parse JSON if the server sent a JSON payload
+        parsed = None
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            try:
+                parsed = resp.json()
+            except Exception:
+                parsed = None
+
+        if parsed is not None:
+            return parsed
+
+        return {"raw": text}
+
+    except Exception as e:
+        print("Error communicating with AI model:", e)
+        return None
+
+
+def click_on_next_page(driver, page_number, wait=None, timeout=10):
+    """Click the pagination link for `page_number`.
+
+    Looks for an element with `data-testid="pagination-page-{n}"`, falls back to
+    an anchor with `aria-label` equal to the page number, then clicks it using the
+    same robust flow used elsewhere (ActionChains -> element.click -> JS click).
+
+    Returns True on success, False on failure.
+    """
+    if wait is None:
+        wait = WebDriverWait(driver, timeout)
+
+    selector = f'[data-testid="pagination-page-{page_number}"]'
+    try:
+        elems = find_elements_in_frames(driver, By.CSS_SELECTOR, selector)
+    except Exception:
+        elems = []
+
+    if not elems:
+        # fallback: anchor with matching aria-label
+        try:
+            elems = find_elements_in_frames(
+                driver, By.XPATH, f"//a[@aria-label='{page_number}']")
+        except Exception:
+            elems = []
+
+    if not elems:
+        return False
+
+    el = elems[0]
+    el = ensure_element_interactable(driver, el, wait)
+
+    try:
+        ActionChains(driver).move_to_element(
+            el).pause(0.05).click(el).perform()
+    except Exception:
+        try:
+            el.click()
+        except Exception:
+            try:
+                driver.execute_script("arguments[0].click();", el)
+            except Exception:
+                return False
+
+    # best-effort wait: many Indeed pagination URLs include a `start=` param
+    try:
+        expected_start = (int(page_number) - 1) * 10
+    except Exception:
+        expected_start = None
+
+    try:
+        wait.until(lambda d: d.execute_script(
+            "return document.readyState") == "complete")
+    except Exception:
+        pass
+
+    if expected_start is not None:
+        try:
+            wait.until(lambda d: f"start={expected_start}" in d.current_url)
+        except Exception:
+            # not critical; still consider click successful
+            pass
+
+    return True
+
+
+if __name__ == "__main__":
+    test = send_request_to_ai_model(
+        "What is today's weather in Cambridge, MA?")
+    print(test["output"][-1]["content"].strip())
